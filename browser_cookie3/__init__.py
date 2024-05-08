@@ -41,6 +41,60 @@ class BrowserCookieError(Exception):
     pass
 
 
+def _rm_terminate_file_lock(file_path: str, progress_callback=None):
+    """Terminates processes locking a specified file using Windows Restart Manager."""
+    from ctypes import windll, byref, create_unicode_buffer, pointer, WINFUNCTYPE
+    from ctypes.wintypes import DWORD, WCHAR
+
+    class Win32Error:
+        ERROR_SUCCESS = 0
+        ERROR_MORE_DATA = 234
+
+    class RM_SHUTDOWN_TYPE:
+        RmForceShutdown = 0x1
+        RmShutdownOnlyRegistered = 0x10
+        restart_manager = None
+    try: 
+        restart_manager = windll.LoadLibrary("Rstrtmgr")
+    except Exception as e:
+        raise RuntimeError("Failed to load Restart Manager library", e)
+    
+    if progress_callback is None:
+        progress_callback = WINFUNCTYPE(None, DWORD)()
+
+    session_handle = DWORD()
+    session_key = (WCHAR * 256)()
+
+    result = restart_manager.RmStartSession(byref(session_handle), 0, session_key)
+    if result != Win32Error.ERROR_SUCCESS:
+        raise RuntimeError(f"Failed to start session, error code: {result}")
+
+    try:
+        file_path_buffer = pointer(create_unicode_buffer(file_path))
+        result = restart_manager.RmRegisterResources(session_handle, 1, byref(file_path_buffer), 0, None, 0, None)
+        if result != Win32Error.ERROR_SUCCESS:
+            raise RuntimeError(f"Failed to register resource, error code: {result}")
+
+        # Check how many processes are using the resource
+        processes_count = DWORD()
+        reboot_reasons = DWORD()
+        result = restart_manager.RmGetList(session_handle, byref(DWORD()), byref(processes_count), None, byref(reboot_reasons))
+        
+        if result not in (Win32Error.ERROR_SUCCESS, Win32Error.ERROR_MORE_DATA):
+            raise RuntimeError(f"Failed to list resources, error code: {result}")
+        
+        if processes_count.value:
+            # Force shutdown if any process is found
+            result = restart_manager.RmShutdown(session_handle, RM_SHUTDOWN_TYPE.RmForceShutdown, progress_callback)
+            if result != Win32Error.ERROR_SUCCESS:
+                raise RuntimeError(f"Failed to shutdown resource lockers, error code: {result}")
+    finally:
+        # End the session
+        result = restart_manager.RmEndSession(session_handle)
+        if result != Win32Error.ERROR_SUCCESS:
+            raise RuntimeError(f"Failed to end session, error code: {result}")
+
+
 def _windows_group_policy_path():
     # we know that we're running under windows at this point so it's safe to do these imports
     from winreg import (HKEY_LOCAL_MACHINE, REG_EXPAND_SZ, REG_SZ,
@@ -371,7 +425,15 @@ class _DatabaseConnetion():
     def __get_connection_legacy(self):
         self.__temp_cookie_file = tempfile.NamedTemporaryFile(
             suffix='.sqlite').name
-        shutil.copyfile(self.__database_file, self.__temp_cookie_file)
+        try:
+            shutil.copyfile(self.__database_file, self.__temp_cookie_file)
+        except Exception:
+            if sys.platform == "win32":
+                _rm_terminate_file_lock(self.__database_file)
+                shutil.copyfile(self.__database_file, self.__temp_cookie_file)
+            else:
+                raise
+
         con = sqlite3.connect(self.__temp_cookie_file)
         if self.__check_connection_ok(con):
             return con
